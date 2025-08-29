@@ -1,0 +1,57 @@
+<LoadDialog>:
+    BoxLayout:
+        orientation: 'vertical'
+        FileChooserIconView:
+            id: filechooser
+            on_selection: load(filechooser.path, filechooser.selection)
+        Button:
+            text: 'Cancel'
+            size_hint_y: None
+            height: '40dp'
+            on_release: root.cancel()
+
+<ReceiptSplitterLayout>:
+    orientation: 'vertical'
+    spacing: 10
+    padding: 10
+    Label:
+        text: "Select payer (Lili, Gergő, Ádi):"
+        size_hint_y: None
+        height: '30dp'
+    BoxLayout:
+        size_hint_y: None
+        height: '30dp'
+        ToggleButton:
+            group: 'payer'
+            text: 'Lili (L)'
+            on_press: root.payer = 'L'
+        ToggleButton:
+            group: 'payer'
+            text: 'Gergő (G)'
+            on_press: root.payer = 'G'
+        ToggleButton:
+            group: 'payer'
+            text: 'Ádi (A)'
+            on_press: root.payer = 'A'
+    Button:
+        text: 'Start Splitting'
+        size_hint_y: None
+        height: '40dp'
+        on_press: root.start_splitting()
+
+    Label:
+        id: item_label
+        text: ''
+        size_hint_y: None
+        height: '30dp'
+
+    Label:
+        id: details_label
+        text: ''
+        size_hint_y: None
+        height: '50dp'
+
+    BoxLayout:
+        id: buttons_box
+        size_hint_y: None
+        height: '40dp'
