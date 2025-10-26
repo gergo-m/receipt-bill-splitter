@@ -1,71 +1,107 @@
 from collections import defaultdict
-
-from PIL import Image
-import pytesseract
+from typing import List, Optional
 import re
+
+import numpy as np
+from PIL import Image
+import streamlit as st
+
+# Your deps
+import pytesseract
 from deep_translator import GoogleTranslator
-import tkinter as tk
-from tkinter import filedialog, messagebox
-import threading
+
+# ----------------- Constants / original config -----------------
 
 split_options = ['L', 'G', 'A', 'LG', 'LGA']
 names = {'L': 'Lili', 'G': 'Gergő', 'A': 'Ádi'}
 
-def extract_receipt_text(image_path):
-    img = Image.open(image_path)
-    text = pytesseract.image_to_string(img, lang='nld')
-    return text
+# ----------------- Original helpers (kept as-is or near-identical) -----------------
 
-def parse_items(text):
-    # Matches e.g.: Tomatenblokjes 3 x 0,64 1,92 B
+def translate_item(name: str) -> str:
+    # Dutch -> English
+    return GoogleTranslator(source='nl', target='en').translate(name)
+
+def extract_receipt_text_from_path(image_path: str) -> str:
+    img = Image.open(image_path).convert("RGB")
+    return pytesseract.image_to_string(img, lang='nld')
+
+def extract_receipt_text_from_image(img: Image.Image) -> str:
+    img = img.convert("RGB")
+    return pytesseract.image_to_string(img, lang='nld')
+
+def parse_items(text: str):
+    """
+    Parsing tuned to handle:
+      - Regular item lines with optional 'N x UUU,DD' before the final price
+      - Weight lines like '1,20 kg x 2,99 EUR' appended to previous item
+      - Discounts: 'In prijs verlaagd', 'Lidl Plus korting', and 'KORTING 25%' etc.
+      - Stop at 'Totaal', capture the total
+    """
     items = []
     last_item = None
     total_price = None
     lines = text.split('\n')
-    pattern = r'(.+?)\s+((?:\d+\s*x\s*\d+,\d+)?)(?:\s+)?(\-?\d+,\d{2})\s+[BC]?'
-    price_adjust_pattern = r'(In prijs verlaagd)\s+(\-?\d+,\d{2})'
+
+    # Strict item row: name   [qty x unit]   price   (optional B/C)
+    item_pattern = re.compile(
+        r'^\s*(.+?)\s+(?:(\d+\s*x\s*\d+,\d{2})\s+)?(-?\d+,\d{2})\s+[BC]?\s*$'
+    )
+
+    # Weight continuation (attach to previous item)
+    kg_pattern = re.compile(r'^\s*(\d+,\d+\s*kg\s*x\s*\d+,\d{2})\s*EUR\s*$', re.IGNORECASE)
+
+    # Known Dutch discount lines
+    price_adjust_pattern = re.compile(r'^\s*(In prijs verlaagd)\s+(-?\d+,\d{2})\s*$', re.IGNORECASE)
+    lidl_plus_pattern = re.compile(r'^\s*(Lidl Plus korting)\s+(-?\d+,\d{2})\s*$', re.IGNORECASE)
+
+    # Generic KORTING (e.g., "KORTING 25%   -0,50")
+    generic_korting_pattern = re.compile(r'^\s*(KORTING(?:\s*\d+%)*?)\s+(-?\d+,\d{2})\s*$', re.IGNORECASE)
+
+    total_line_pattern = re.compile(r'Totaal\s+(\d+,\d{2})', re.IGNORECASE)
+
     for i, line in enumerate(lines):
+        raw = line.strip()
+        if not raw:
+            continue
+
         # Stop at "Totaal"
-        if 'Totaal' in line:
-            # Extract total price for reporting
-            match = re.search(r'Totaal\s+(\d+,\d{2})', line)
-            if match:
-                total_price = float(match.group(1).replace(',', '.'))
+        if 'Totaal' in raw:
+            m = total_line_pattern.search(raw)
+            if m:
+                total_price = float(m.group(1).replace(',', '.'))
             break
 
-        # Attach kg lines (next line) to last item if found
-        kg_match = re.match(r'(\d+,\d+ kg x \d+,\d+)\s+EUR', line)
-        if kg_match and last_item:
-            last_item['amount'] = kg_match.group(1)
+        # Weight continuation attaches to the last item
+        m_kg = kg_pattern.match(raw)
+        if m_kg and last_item:
+            last_item['amount'] = m_kg.group(1)
             continue
 
-        # Match regular item row
-        match = re.match(pattern, line)
-        if match:
-            name = match.group(1).strip()
-            tr_name = translate_item(name)
-            amount = match.group(2).replace(',', '.').strip() if match.group(2) else None
-            price = float(match.group(3).replace(',', '.'))
-            item = {'name': name, 'tr_name': tr_name, 'amount': amount if amount else None, 'price': price}
-            items.append(item)
-            last_item = item
-            continue
-
-        # Include "In prijs verlaagd" lines
-        adj_match = re.match(price_adjust_pattern, line)
-        if adj_match:
-            name = adj_match.group(1).strip()
-            tr_name = translate_item(name)
-            price = float(adj_match.group(2).replace(',', '.'))
-            item = {'name': name, 'tr_name': tr_name, 'amount': None, 'price': price}
-            items.append(item)
-            continue
+        # Discounts (known + generic KORTING)
+        for pat in (price_adjust_pattern, lidl_plus_pattern, generic_korting_pattern):
+            m_disc = pat.match(raw)
+            if m_disc:
+                name = m_disc.group(1).strip()
+                tr_name = translate_item(name)
+                price = float(m_disc.group(2).replace(',', '.'))
+                item = {'name': name, 'tr_name': tr_name, 'amount': None, 'price': price}
+                items.append(item)
+                last_item = item
+                break
+        else:
+            # Regular item row
+            m_item = item_pattern.match(raw)
+            if m_item:
+                name = m_item.group(1).strip()
+                amount = m_item.group(2).strip() if m_item.group(2) else None
+                price = float(m_item.group(3).replace(',', '.'))
+                tr_name = translate_item(name)
+                item = {'name': name, 'tr_name': tr_name, 'amount': amount, 'price': price}
+                items.append(item)
+                last_item = item
+            # else: line ignored
 
     return items, total_price
-
-def translate_item(name):
-    translated = GoogleTranslator(source='nl', target='en').translate(name)
-    return translated
 
 def calculate_balances(items, splits, payer):
     person_map = {'L': ['L'], 'G': ['G'], 'A': ['A'], 'LG': ['L', 'G'], 'LGA': ['L', 'G', 'A']}
@@ -81,118 +117,128 @@ def calculate_balances(items, splits, payer):
             balances[person] = round(costs[person], 2)
     return balances
 
-class ReceiptSplitter(tk.Toplevel):
-    def __init__(self, items, total_price):
-        super().__init__()
-        self.title("Receipt Splitter")
-        self.items = items
-        self.total_price = total_price
-        self.cur_index = 0
-        self.splits = []
-        self.payer = tk.StringVar()
-        tk.Label(self, text="Who paid?").pack()
-        for p in ['L', 'G', 'A']:
-            tk.Radiobutton(self, text=names[p], variable=self.payer, value=p).pack(anchor='w')
-        tk.Button(self, text="Start splitting", command=self.start_splitting).pack(pady=10)
+# ----------------- Streamlit UI -----------------
 
-    def start_splitting(self):
-        if not self.payer.get():
-            tk.messagebox.showerror('Who paid?', 'Please select payer before proceeding.')
-            return
-        self.next_item()
+st.set_page_config(page_title="Receipt Splitter", page_icon="🧾", layout="centered")
 
-    def next_item(self):
-        if self.cur_index >= len(self.items):
-            self.show_results()
-            self.destroy()
-            return
-        if hasattr(self, 'item_frame'):
-            self.item_frame.destroy()
-        self.item_frame = tk.Frame(self)
-        self.item_frame.pack()
-        item = self.items[self.cur_index]
-        tk.Label(self.item_frame, text=f"Item: {item['name']} ({item['tr_name']})").pack()
-        tk.Label(self.item_frame, text=f"Amount: {item['amount'] if item['amount'] else 1}\nPrice: €{item['price']:.2f}").pack()
-        for split in split_options:
-            btn = tk.Button(self.item_frame, text=split, command=lambda s=split: self.choose_split(s))
-            btn.pack(side='left')
+st.title("🧾 Receipt Bill Splitter")
+st.caption("Upload a receipt image → OCR (Tesseract nld) → parse items → assign splits → see balances.")
 
-    def choose_split(self, split):
-        self.splits.append(split)
-        self.item_frame.destroy()
-        self.cur_index += 1
-        self.next_item()
+# Session state init (use names that do NOT collide with dict methods)
+if "receipt_items" not in st.session_state:
+    st.session_state.receipt_items: List[dict] = []
+    st.session_state.total_price: Optional[float] = None
+    st.session_state.cur_index: int = 0
+    st.session_state.splits: List[str] = []
+    st.session_state.payer: Optional[str] = None
+    st.session_state.started: bool = False
+    st.session_state.ocr_text: Optional[str] = None
+    st.session_state.image_preview: Optional[np.ndarray] = None
 
-    def show_results(self):
-        print('-------------------------------------')
-        print(f"{'Item':35} {'Translation':30} {'Amount':15} {'Price':8} {'Split':5}")
-        print('-' * 100)
-        for item, split in zip(self.items, self.splits):
-            name_str = f"{item['name'][:33]:35}"  # max length 33 + 2 spaces padding
-            translation_str = f"{item['tr_name'][:28]:30}"  # max 28 + 2 spaces
-            amount_str = f"{item['amount'] if item['amount'] else '':15}"
-            price_str = f"{item['price']:.2f}"
-            split_str = f"({split})"
-            print(f"{name_str} {translation_str} {amount_str} {price_str:>8} {split_str:5}")
-        print('-' * 100)
-        print(f"{names[self.payer.get()]} paid {self.total_price:.2f} EUR in total")
-        splits = calculate_balances(self.items, self.splits, self.payer.get())
-        for person, amount in splits.items():
-            if person == self.payer.get():
-                continue
-            print(f"{names[person]} pays {names[self.payer.get()]} {amount:.2f} EUR")
-        exit(0)
+def reset_state():
+    st.session_state.receipt_items = []
+    st.session_state.total_price = None
+    st.session_state.cur_index = 0
+    st.session_state.splits = []
+    st.session_state.payer = None
+    st.session_state.started = False
+    st.session_state.ocr_text = None
+    st.session_state.image_preview = None
 
-class ReceiptApp(tk.Tk):
-    def __init__(self):
-        super().__init__()
-        self.title("Upload Receipt")
-        self.geometry("300x100")
-        self.btn = tk.Button(self, text="Select Digital Receipt Image", command=self.upload_file)
-        self.btn.pack(expand=True)
-        self.loading_popup = None
-
-    def show_loading(self):
-        self.loading_popup = tk.Toplevel(self)
-        self.loading_popup.title("Please wait")
-        self.loading_popup.geometry("200x80")
-        tk.Label(self.loading_popup, text="Scanning receipt...\nPlease wait.").pack(pady=20)
-        self.loading_popup.grab_set()
-        self.update()
-
-    def close_loading(self):
-        if self.loading_popup:
-            self.loading_popup.destroy()
-            self.loading_popup = None
-
-    def process_receipt(self, file_path):
-        try:
-            receipt_text = extract_receipt_text(file_path)
-            receipt_items, total_price = parse_items(receipt_text)
-            # Close loading popup in main thread
-            self.after(0, self.close_loading)
-            # Close file select window and open splitter
-            self.after(0, lambda: self.open_splitter(receipt_items, total_price))  # close main window
-        except Exception as e:
-            self.after(0, self.close_loading)
-            self.after(0, lambda: messagebox.showerror("Error", f"Failed to process image: \n{e}"))
-
-    def open_splitter(self, receipt_items, total_price):
-        self.withdraw()
-        splitter = ReceiptSplitter(receipt_items, total_price)
-        splitter.grab_set()
-
-    def upload_file(self):
-        file_path = filedialog.askopenfilename(
-            title="Select Digital Receipt Image",
-            filetypes=(("Image files", "*.jpg *.jpeg *.png *.bmp"), ("All files", "*.*"))
+with st.expander("Upload & OCR", expanded=(len(st.session_state.receipt_items) == 0)):
+    file = st.file_uploader("Select digital receipt image (JPG/PNG/BMP)", type=["jpg","jpeg","png","bmp"])
+    colA, colB = st.columns([1,1])
+    with colA:
+        payer_choice = st.radio(
+            "Who paid?",
+            ['L','G','A'],
+            format_func=lambda x: names[x],
+            index=0 if st.session_state.payer is None else ['L','G','A'].index(st.session_state.payer)
         )
-        if file_path:
-            self.show_loading()
-            # Run the OCR and parsing in a separate thread
-            threading.Thread(target=self.process_receipt, args=(file_path,), daemon=True).start()
+        st.session_state.payer = payer_choice
+    with colB:
+        # If your Streamlit version errors on type="primary", just remove that kwarg.
+        start_clicked = st.button("Start splitting", type="primary", disabled=(not file))
+    if start_clicked and file:
+        # OCR – mirror your behavior (Tesseract 'nld')
+        image = Image.open(file).convert("RGB")
+        st.session_state.image_preview = np.array(image)
+        with st.spinner("Scanning receipt with Tesseract (nld)…"):
+            text = extract_receipt_text_from_image(image)
+        st.session_state.ocr_text = text
+        items, total_price = parse_items(text)
+        st.session_state.receipt_items = items
+        st.session_state.total_price = total_price
+        st.session_state.started = True
+        st.session_state.cur_index = 0
+        st.session_state.splits = []
 
+if st.session_state.image_preview is not None:
+    # use_column_width works across Streamlit versions
+    st.image(st.session_state.image_preview, caption="Receipt preview", use_container_width=True)
 
-if __name__ == '__main__':
-    app = ReceiptApp()
-    app.mainloop()
+if st.session_state.ocr_text:
+    with st.expander("Show OCR text"):
+        st.code(st.session_state.ocr_text or "", language="text")
+
+# Splitting workflow (one item at a time)
+if st.session_state.started and len(st.session_state.receipt_items) > 0:
+    i = st.session_state.cur_index
+    total_items = len(st.session_state.receipt_items)
+
+    if i < total_items:
+        item = st.session_state.receipt_items[i]
+        st.subheader(f"Item {i+1}/{total_items}")
+        st.write(f"**Item:** {item['name']}  \n**Translation:** {item['tr_name']}")
+        st.write(f"**Amount:** {item['amount'] if item['amount'] else '1'}  \n**Price:** €{item['price']:.2f}")
+
+        cols = st.columns(len(split_options))
+        for idx, split in enumerate(split_options):
+            if cols[idx].button(split, key=f"split_{i}_{split}"):
+                st.session_state.splits.append(split)
+                st.session_state.cur_index += 1
+                st.rerun()
+
+    # Done → show results (same content as your printout, but formatted)
+    if st.session_state.cur_index >= total_items:
+        st.success("Splitting complete.")
+        st.subheader("Items & splits")
+
+        import pandas as pd
+        rows = []
+        for it, sp in zip(st.session_state.receipt_items, st.session_state.splits):
+            rows.append({
+                "Item": it['name'],
+                "Translation": it['tr_name'],
+                "Amount": it['amount'] if it['amount'] else "",
+                "Price (€)": f"{it['price']:.2f}",
+                "Split": sp
+            })
+        df = pd.DataFrame(rows)
+        st.dataframe(df, use_container_width=True)
+
+        payer_code = st.session_state.payer
+        payer_name = names[payer_code]
+        total_price = st.session_state.total_price or sum(it['price'] for it in st.session_state.receipt_items)
+
+        st.markdown("---")
+        st.subheader("Totals")
+        st.write(f"**{payer_name}** paid **€{total_price:.2f}** in total.")
+
+        balances = calculate_balances(st.session_state.receipt_items, st.session_state.splits, payer_code)
+
+        st.subheader("Balances")
+        for person, amount in balances.items():
+            if person == payer_code:
+                continue
+            st.write(f"**{names[person]}** pays **{payer_name}** €{amount:.2f}")
+
+        st.markdown("---")
+        col1, col2 = st.columns(2)
+        if col1.button("Start over"):
+            reset_state()
+            st.rerun()
+        col2.caption("Have a great day!")
+
+else:
+    st.info("Upload a receipt, choose who paid, then click **Start splitting**.")
