@@ -6,9 +6,16 @@ import numpy as np
 from PIL import Image
 import streamlit as st
 
-# Your deps
 import pytesseract
+from pytesseract import TesseractNotFoundError
 from deep_translator import GoogleTranslator
+
+_tess = shutil.which("tesseract")
+if _tess:
+    pytesseract.pytesseract.tesseract_cmd = _tess
+else:
+    # Common path on Debian-based images used by Streamlit Cloud
+    pytesseract.pytesseract.tesseract_cmd = "/usr/bin/tesseract"
 
 # ----------------- Constants / original config -----------------
 
