@@ -6,6 +6,7 @@ import numpy as np
 from PIL import Image
 import streamlit as st
 
+import shutil
 import pytesseract
 from pytesseract import TesseractNotFoundError
 from deep_translator import GoogleTranslator
